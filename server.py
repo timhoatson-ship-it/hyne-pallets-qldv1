@@ -6688,18 +6688,39 @@ def dispatch(method, path, params, body, conn):
         current_user = get_current_user(conn)
         if not current_user:
             return {"status": 401, "body": {"error": "Unauthorized"}}
+        status_filter = params.get("status")
+        if status_filter == "pending":
+            rows = rows_to_list(conn.execute(
+                "SELECT * FROM timber_supplier_approvals ORDER BY requested_at DESC"
+            ).fetchall())
+            return {"status": 200, "body": rows}
         rows = rows_to_list(conn.execute(
             "SELECT * FROM timber_suppliers WHERE is_active=1 ORDER BY name"
         ).fetchall())
-        return {"status": 200, "body": {"suppliers": rows}}
+        return {"status": 200, "body": rows}
 
     if method == "POST" and path == "/timber/suppliers":
         current_user = get_current_user(conn)
-        if not _is_exec(current_user):
-            return {"status": 403, "body": {"error": "Executive role required"}}
+        if not current_user:
+            return {"status": 401, "body": {"error": "Unauthorized"}}
         name = body.get("name", "").strip()
         if not name:
             return {"status": 400, "body": {"error": "name required"}}
+        # Yardsman can create pending suppliers; exec creates approved
+        if body.get("status") == "pending" or body.get("requested_by") == "yardsman":
+            cur = conn.execute(
+                """INSERT INTO timber_supplier_approvals
+                   (supplier_name, requested_by, status)
+                   VALUES (?,?,?)""",
+                [name, current_user.get("username", ""), "pending"]
+            )
+            conn.commit()
+            row = row_to_dict(conn.execute(
+                "SELECT * FROM timber_supplier_approvals WHERE id=?", [cur.lastrowid]
+            ).fetchone())
+            return {"status": 201, "body": row}
+        if not _is_exec(current_user):
+            return {"status": 403, "body": {"error": "Executive role required"}}
         cur = conn.execute(
             """INSERT INTO timber_suppliers
                (name, abn, contact_name, contact_email, contact_phone,
@@ -6716,7 +6737,7 @@ def dispatch(method, path, params, body, conn):
         row = row_to_dict(conn.execute(
             "SELECT * FROM timber_suppliers WHERE id=?", [cur.lastrowid]
         ).fetchone())
-        return {"status": 201, "body": {"supplier": row}}
+        return {"status": 201, "body": row}
 
     m = match("/timber/suppliers/:id", path)
     if m and method == "PUT":
@@ -6744,7 +6765,50 @@ def dispatch(method, path, params, body, conn):
         row = row_to_dict(conn.execute(
             "SELECT * FROM timber_suppliers WHERE id=?", [sid]
         ).fetchone())
-        return {"status": 200, "body": {"supplier": row}}
+        return {"status": 200, "body": row}
+
+
+    m = match("/timber/suppliers/:id/approve", path)
+    if m and method == "POST":
+        current_user = get_current_user(conn)
+        if not _is_exec(current_user):
+            return {"status": 403, "body": {"error": "Executive role required"}}
+        aid = int(m["id"])
+        approval = row_to_dict(conn.execute(
+            "SELECT * FROM timber_supplier_approvals WHERE id=?", [aid]
+        ).fetchone())
+        if not approval:
+            return {"status": 404, "body": {"error": "Approval not found"}}
+        conn.execute(
+            "UPDATE timber_supplier_approvals SET status='approved', approved_by=?, approved_at=CURRENT_TIMESTAMP WHERE id=?",
+            [current_user.get("username"), aid]
+        )
+        cur2 = conn.execute(
+            """INSERT INTO timber_suppliers
+               (name, abn, contact_name, contact_email, contact_phone,
+                approval_status, created_by)
+               VALUES (?,?,?,?,?,'approved',?)""",
+            [approval["supplier_name"], approval.get("abn"),
+             approval.get("contact_name"), approval.get("contact_email"),
+             approval.get("contact_phone"), current_user.get("username")]
+        )
+        conn.commit()
+        log_audit(conn, current_user["id"], "APPROVE_TIMBER_SUPPLIER",
+                  "timber_suppliers", cur2.lastrowid, None, approval)
+        return {"status": 200, "body": {"message": "Supplier approved and created", "supplier_id": cur2.lastrowid}}
+
+    m = match("/timber/suppliers/:id/reject", path)
+    if m and method == "POST":
+        current_user = get_current_user(conn)
+        if not _is_exec(current_user):
+            return {"status": 403, "body": {"error": "Executive role required"}}
+        aid = int(m["id"])
+        conn.execute(
+            "UPDATE timber_supplier_approvals SET status='rejected', approved_by=?, approved_at=CURRENT_TIMESTAMP WHERE id=?",
+            [current_user.get("username"), aid]
+        )
+        conn.commit()
+        return {"status": 200, "body": {"message": "Approval rejected"}}
 
     # ----- SUPPLIER APPROVALS -----
 
@@ -6836,7 +6900,7 @@ def dispatch(method, path, params, body, conn):
             args.append(f"%{grade}%")
         qry += " ORDER BY type_prefix, width_mm, thickness_mm, length_mm"
         rows = rows_to_list(conn.execute(qry, args).fetchall())
-        return {"status": 200, "body": {"specs": rows}}
+        return {"status": 200, "body": rows}
 
     if method == "POST" and path == "/timber/specs":
         current_user = get_current_user(conn)
@@ -6869,7 +6933,7 @@ def dispatch(method, path, params, body, conn):
         row = row_to_dict(conn.execute(
             "SELECT * FROM timber_specs WHERE id=?", [cur.lastrowid]
         ).fetchone())
-        return {"status": 201, "body": {"spec": row}}
+        return {"status": 201, "body": row}
 
     m = match("/timber/specs/:id", path)
     if m and method == "PUT":
@@ -6895,20 +6959,20 @@ def dispatch(method, path, params, body, conn):
         row = row_to_dict(conn.execute(
             "SELECT * FROM timber_specs WHERE id=?", [sid]
         ).fetchone())
-        return {"status": 200, "body": {"spec": row}}
+        return {"status": 200, "body": row}
 
     # ----- GRADES -----
 
-    if method == "GET" and path == "/timber/grades":
+    if method == "GET" and path in ("/timber/grades", "/timber/grade-codes"):
         current_user = get_current_user(conn)
         if not current_user:
             return {"status": 401, "body": {"error": "Unauthorized"}}
         rows = rows_to_list(conn.execute(
             "SELECT * FROM timber_grade_codes WHERE is_active=1 ORDER BY code"
         ).fetchall())
-        return {"status": 200, "body": {"grades": rows}}
+        return {"status": 200, "body": rows}
 
-    if method == "POST" and path == "/timber/grades":
+    if method == "POST" and path in ("/timber/grades", "/timber/grade-codes"):
         current_user = get_current_user(conn)
         if not _is_exec(current_user):
             return {"status": 403, "body": {"error": "Executive role required"}}
@@ -6924,7 +6988,7 @@ def dispatch(method, path, params, body, conn):
         row = row_to_dict(conn.execute(
             "SELECT * FROM timber_grade_codes WHERE id=?", [cur.lastrowid]
         ).fetchone())
-        return {"status": 201, "body": {"grade": row}}
+        return {"status": 201, "body": row}
 
     m = match("/timber/grades/:id", path)
     if m and method == "PUT":
@@ -6944,7 +7008,7 @@ def dispatch(method, path, params, body, conn):
         row = row_to_dict(conn.execute(
             "SELECT * FROM timber_grade_codes WHERE id=?", [gid]
         ).fetchone())
-        return {"status": 200, "body": {"grade": row}}
+        return {"status": 200, "body": row}
 
     # ----- CONFIG -----
 
@@ -6955,7 +7019,8 @@ def dispatch(method, path, params, body, conn):
         rows = rows_to_list(conn.execute(
             "SELECT * FROM timber_config ORDER BY key"
         ).fetchall())
-        return {"status": 200, "body": {"config": rows}}
+        cfg = {r["key"]: r["value"] for r in rows}
+        return {"status": 200, "body": cfg}
 
     if method == "PUT" and path == "/timber/config":
         current_user = get_current_user(conn)
@@ -6996,7 +7061,7 @@ def dispatch(method, path, params, body, conn):
             "SELECT td.*, ts.name as supplier_name FROM timber_deliveries td "
             "LEFT JOIN timber_suppliers ts ON ts.id=td.supplier_id WHERE td.id=?", [did]
         ).fetchone())
-        return {"status": 201, "body": {"delivery": row}}
+        return {"status": 201, "body": row}
 
     if method == "GET" and path == "/timber/deliveries":
         current_user = get_current_user(conn)
@@ -7008,11 +7073,13 @@ def dispatch(method, path, params, body, conn):
         args = []
         status_filter = params.get("status")
         if status_filter:
-            qry += " WHERE td.status=?"
-            args.append(status_filter)
+            statuses = [s.strip() for s in status_filter.split(",")]
+            placeholders = ",".join("?" for _ in statuses)
+            qry += f" WHERE td.status IN ({placeholders})"
+            args.extend(statuses)
         qry += " ORDER BY td.created_at DESC"
         rows = rows_to_list(conn.execute(qry, args).fetchall())
-        return {"status": 200, "body": {"deliveries": rows}}
+        return {"status": 200, "body": rows}
 
     m = match("/timber/deliveries/:id", path)
     if m and method == "GET":
@@ -7034,7 +7101,7 @@ def dispatch(method, path, params, body, conn):
             [did]
         ).fetchall())
         delivery["items"] = items
-        return {"status": 200, "body": {"delivery": delivery}}
+        return {"status": 200, "body": delivery}
 
     m = match("/timber/deliveries/:id", path)
     if m and method == "PUT":
@@ -7055,7 +7122,7 @@ def dispatch(method, path, params, body, conn):
         row = row_to_dict(conn.execute(
             "SELECT * FROM timber_deliveries WHERE id=?", [did]
         ).fetchone())
-        return {"status": 200, "body": {"delivery": row}}
+        return {"status": 200, "body": row}
 
     m = match("/timber/deliveries/:id/complete", path)
     if m and method == "POST":
@@ -7071,6 +7138,22 @@ def dispatch(method, path, params, body, conn):
         log_audit(conn, current_user["id"], "COMPLETE_TIMBER_DELIVERY",
                   "timber_deliveries", did, None, {"status": "completed"})
         return {"status": 200, "body": {"message": "Delivery completed"}}
+
+
+    m = match("/timber/deliveries/:id/items", path)
+    if m and method == "GET":
+        current_user = get_current_user(conn)
+        if not current_user:
+            return {"status": 401, "body": {"error": "Unauthorized"}}
+        did = int(m["id"])
+        items = rows_to_list(conn.execute(
+            """SELECT tdi.*, tsp.description as spec_description, tsp.myob_code
+               FROM timber_delivery_items tdi
+               LEFT JOIN timber_specs tsp ON tsp.id=tdi.spec_id
+               WHERE tdi.delivery_id=? ORDER BY tdi.id""",
+            [did]
+        ).fetchall())
+        return {"status": 200, "body": items}
 
     # ----- DELIVERY ITEMS -----
 
@@ -7095,7 +7178,7 @@ def dispatch(method, path, params, body, conn):
         row = row_to_dict(conn.execute(
             "SELECT * FROM timber_delivery_items WHERE id=?", [cur.lastrowid]
         ).fetchone())
-        return {"status": 201, "body": {"delivery_item": row}}
+        return {"status": 201, "body": row}
 
     m = match("/timber/delivery-items/:id", path)
     if m and method == "PUT":
@@ -7117,7 +7200,7 @@ def dispatch(method, path, params, body, conn):
         row = row_to_dict(conn.execute(
             "SELECT * FROM timber_delivery_items WHERE id=?", [iid]
         ).fetchone())
-        return {"status": 200, "body": {"delivery_item": row}}
+        return {"status": 200, "body": row}
 
     m = match("/timber/delivery-items/:id", path)
     if m and method == "DELETE":
@@ -7184,7 +7267,38 @@ def dispatch(method, path, params, body, conn):
             "SELECT * FROM timber_packs WHERE id=?", [pid]
         ).fetchone())
         _cost_fields(current_user, row)
-        return {"status": 201, "body": {"pack": row}}
+        return {"status": 201, "body": row}
+
+
+    if method == "GET" and path == "/timber/packs":
+        current_user = get_current_user(conn)
+        if not current_user:
+            return {"status": 401, "body": {"error": "Unauthorized"}}
+        qry = """SELECT tp.*, ts.description as spec_description, ts.myob_code,
+                        ts.type_prefix, ts.width_mm, ts.thickness_mm, ts.length_mm,
+                        tsu.name as supplier_name
+                 FROM timber_packs tp
+                 LEFT JOIN timber_specs ts ON ts.id=tp.spec_id
+                 LEFT JOIN timber_suppliers tsu ON tsu.id=tp.supplier_id
+                 WHERE 1=1"""
+        args = []
+        if params.get("supplier_id"):
+            qry += " AND tp.supplier_id=?"
+            args.append(params["supplier_id"])
+        if params.get("spec_id"):
+            qry += " AND tp.spec_id=?"
+            args.append(params["spec_id"])
+        status_f = params.get("status", "inventory")
+        qry += " AND tp.status=?"
+        args.append(status_f)
+        qry += " ORDER BY tp.received_date ASC, tp.id ASC"
+        rows = rows_to_list(conn.execute(qry, args).fetchall())
+        show_cost = _is_exec(current_user)
+        if not show_cost:
+            for r in rows:
+                r.pop("cost_per_m3", None)
+                r.pop("pack_cost_total", None)
+        return {"status": 200, "body": rows}
 
     # ----- INVENTORY -----
 
@@ -7225,7 +7339,33 @@ def dispatch(method, path, params, body, conn):
                 r.pop("cost_per_m3", None)
                 r.pop("pack_cost_total", None)
             result.append(r)
-        return {"status": 200, "body": {"packs": result, "count": len(result)}}
+        return {"status": 200, "body": result}
+
+
+    if method == "GET" and path == "/timber/summary":
+        current_user = get_current_user(conn)
+        if not current_user:
+            return {"status": 401, "body": {"error": "Unauthorized"}}
+        summary_row = conn.execute(
+            """SELECT COUNT(*) as pack_count,
+                      COALESCE(SUM(m3_volume),0) as total_m3,
+                      COALESCE(SUM(pack_cost_total),0) as total_value
+               FROM timber_packs WHERE status='inventory'"""
+        ).fetchone()
+        summary = dict(summary_row)
+        if not _is_exec(current_user):
+            summary.pop("total_value", None)
+        by_type = rows_to_list(conn.execute(
+            """SELECT ts.type_prefix,
+                      COUNT(tp.id) as pack_count,
+                      COALESCE(SUM(tp.m3_volume),0) as total_m3
+               FROM timber_packs tp
+               LEFT JOIN timber_specs ts ON ts.id=tp.spec_id
+               WHERE tp.status='inventory'
+               GROUP BY ts.type_prefix ORDER BY ts.type_prefix"""
+        ).fetchall())
+        summary["by_type"] = by_type
+        return {"status": 200, "body": summary}
 
     if method == "GET" and path == "/timber/inventory/summary":
         current_user = get_current_user(conn)
@@ -7271,7 +7411,7 @@ def dispatch(method, path, params, body, conn):
         if not row:
             return {"status": 404, "body": {"error": "Pack not found"}}
         _cost_fields(current_user, row)
-        return {"status": 200, "body": {"pack": row}}
+        return {"status": 200, "body": row}
 
     # ----- CONSUMPTION -----
 
@@ -7531,7 +7671,7 @@ def dispatch(method, path, params, body, conn):
         rows = rows_to_list(conn.execute(
             "SELECT * FROM timber_cost_imports ORDER BY import_date DESC"
         ).fetchall())
-        return {"status": 200, "body": {"imports": rows}}
+        return {"status": 200, "body": rows}
 
     if method == "GET" and path == "/timber/valuation":
         current_user = get_current_user(conn)
@@ -7785,7 +7925,7 @@ def dispatch(method, path, params, body, conn):
             "count": len(old_packs),
         }}
 
-    if method == "GET" and path == "/timber/reports/undo-log":
+    if method == "GET" and path in ("/timber/reports/undo-log", "/timber/undo-log"):
         current_user = get_current_user(conn)
         if not _is_exec(current_user):
             return {"status": 403, "body": {"error": "Executive role required"}}
@@ -7796,7 +7936,7 @@ def dispatch(method, path, params, body, conn):
                LEFT JOIN timber_specs ts ON ts.id=tp.spec_id
                ORDER BY tcu.undone_at DESC"""
         ).fetchall())
-        return {"status": 200, "body": {"undo_log": rows}}
+        return {"status": 200, "body": rows}
 
     if method == "GET" and path == "/timber/reports/export/myob":
         current_user = get_current_user(conn)
@@ -7818,7 +7958,7 @@ def dispatch(method, path, params, body, conn):
 
     # ----- LOW STOCK ALERTS -----
 
-    if method == "GET" and path == "/timber/low-stock-alerts":
+    if method == "GET" and path in ("/timber/low-stock-alerts", "/timber/stock-alerts"):
         current_user = get_current_user(conn)
         if not current_user:
             return {"status": 401, "body": {"error": "Unauthorized"}}
@@ -7828,9 +7968,9 @@ def dispatch(method, path, params, body, conn):
                LEFT JOIN timber_specs ts ON ts.id=la.spec_id
                ORDER BY la.id"""
         ).fetchall())
-        return {"status": 200, "body": {"alerts": rows}}
+        return {"status": 200, "body": rows}
 
-    if method == "POST" and path == "/timber/low-stock-alerts":
+    if method == "POST" and path in ("/timber/low-stock-alerts", "/timber/stock-alerts"):
         current_user = get_current_user(conn)
         if not _is_exec(current_user):
             return {"status": 403, "body": {"error": "Executive role required"}}
