@@ -12,6 +12,8 @@ import hashlib
 import re
 import traceback
 import sqlite3
+import hmac
+import time
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -30,15 +32,28 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
 # ---------------------------------------------------------------------------
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
 def hash_password(password):
-    return hashlib.sha256((password + "hyne_salt").encode()).hexdigest()
+    """Hash password using werkzeug's PBKDF2 (with per-user salt + work factor)."""
+    from werkzeug.security import generate_password_hash
+    return generate_password_hash(password, method='pbkdf2:sha256', salt_length=16)
+
+
+def check_password(stored_hash, password):
+    """Verify password against stored hash. Supports both new werkzeug and legacy SHA256."""
+    from werkzeug.security import check_password_hash
+    if stored_hash and stored_hash.startswith("pbkdf2:"):
+        return check_password_hash(stored_hash, password)
+    # Legacy SHA256 fallback for existing accounts
+    legacy = hashlib.sha256((password + "hyne_salt").encode()).hexdigest()
+    return stored_hash == legacy
 
 
 def row_to_dict(row):
@@ -412,7 +427,11 @@ CREATE TABLE IF NOT EXISTS notification_log (
     subject TEXT,
     body TEXT,
     sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    status TEXT DEFAULT 'sent'
+    status TEXT DEFAULT 'queued',
+    delivery_status TEXT DEFAULT 'queued',
+    delivered_at TIMESTAMP,
+    attempted_at TIMESTAMP,
+    error_message TEXT
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -425,6 +444,13 @@ CREATE TABLE IF NOT EXISTS audit_log (
     new_value TEXT,
     ip_address TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS login_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    identifier TEXT NOT NULL,
+    attempt_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    success BOOLEAN DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS schedule_entries (
@@ -2168,6 +2194,21 @@ def migrate_db():
             )
             conn.commit()
 
+    # --- notification_log: add missing columns ---
+    for col, defn in [("delivery_status", "TEXT DEFAULT 'queued'"), ("delivered_at", "TIMESTAMP"), ("attempted_at", "TIMESTAMP"), ("error_message", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE notification_log ADD COLUMN {col} {defn}")
+            conn.commit()
+        except Exception:
+            pass
+
+    # --- login_attempts table ---
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS login_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT, identifier TEXT NOT NULL, attempt_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, success BOOLEAN DEFAULT 0)")
+        conn.commit()
+    except Exception:
+        pass
+
     conn.close()
 
 
@@ -2175,18 +2216,37 @@ def migrate_db():
 # Auth helpers
 # ---------------------------------------------------------------------------
 
-SECRET = "hyne_pallets_secret_2026"
+JWT_SECRET = os.environ.get("JWT_SECRET", "hyne_pallets_secret_2026_CHANGE_ME")
+JWT_EXPIRY_SECONDS = 86400 * 7  # 7 days
 
 
 def make_token(user_id, role):
-    payload = json.dumps({"user_id": user_id, "role": role, "ts": datetime.now(timezone.utc).isoformat()})
-    return base64.b64encode(payload.encode()).decode()
+    """Create HMAC-signed JWT token."""
+    header = base64.urlsafe_b64encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode()).decode().rstrip("=")
+    payload_data = {"user_id": user_id, "role": role, "exp": int(time.time()) + JWT_EXPIRY_SECONDS, "iat": int(time.time())}
+    payload = base64.urlsafe_b64encode(json.dumps(payload_data).encode()).decode().rstrip("=")
+    signature = hmac.new(JWT_SECRET.encode(), f"{header}.{payload}".encode(), hashlib.sha256).hexdigest()
+    return f"{header}.{payload}.{signature}"
 
 
 def decode_token(token):
+    """Verify HMAC signature and decode JWT token. Returns payload dict or None."""
     try:
-        payload = json.loads(base64.b64decode(token.encode()).decode())
-        return payload
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        header_b64, payload_b64, sig = parts
+        # Verify signature
+        expected_sig = hmac.new(JWT_SECRET.encode(), f"{header_b64}.{payload_b64}".encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            return None
+        # Decode payload (add padding)
+        payload_b64 += "=" * (4 - len(payload_b64) % 4)
+        payload_data = json.loads(base64.urlsafe_b64decode(payload_b64.encode()).decode())
+        # Check expiry
+        if payload_data.get("exp", 0) < int(time.time()):
+            return None
+        return payload_data
     except Exception:
         return None
 
@@ -2212,6 +2272,24 @@ def require_auth(conn):
     if not user:
         return None
     return user
+
+
+def check_rate_limit(conn, identifier, max_attempts=10, window_minutes=60):
+    """Check if identifier is rate-limited. Returns (allowed: bool, attempts_remaining: int)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=window_minutes)).isoformat()
+    count = conn.execute("SELECT COUNT(*) FROM login_attempts WHERE identifier=? AND attempt_at>? AND success=0", [identifier, cutoff]).fetchone()[0]
+    return (count < max_attempts, max(0, max_attempts - count))
+
+
+def record_login_attempt(conn, identifier, success=False):
+    """Record a login attempt."""
+    conn.execute("INSERT INTO login_attempts (identifier, success, attempt_at) VALUES (?,?,?)",
+        [identifier, 1 if success else 0, datetime.now(timezone.utc).isoformat()])
+    conn.commit()
+    # Clean old attempts (older than 24h)
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    conn.execute("DELETE FROM login_attempts WHERE attempt_at<?", [cutoff])
+    conn.commit()
 
 
 def log_audit(conn, user_id, action, entity_type=None, entity_id=None, old_val=None, new_val=None):
@@ -2558,12 +2636,20 @@ def dispatch(method, path, params, body, conn):
         password = body.get("password", "")
         if not email or not password:
             return {"status": 400, "body": {"error": "email and password required"}}
-        pw_hash = hash_password(password)
-        row = conn.execute("SELECT * FROM users WHERE email=? AND password_hash=? AND is_active=1", [email, pw_hash]).fetchone()
-        if not row:
+        allowed, remaining = check_rate_limit(conn, f"email:{email}")
+        if not allowed:
+            return {"status": 429, "body": {"error": "Too many attempts. Try again later."}}
+        row = conn.execute("SELECT * FROM users WHERE email=? AND is_active=1", [email]).fetchone()
+        if not row or not check_password(row_to_dict(row).get("password_hash", ""), password):
+            record_login_attempt(conn, f"email:{email}", False)
             return {"status": 401, "body": {"error": "Invalid credentials"}}
         user = row_to_dict(row)
         token = make_token(user["id"], user["role"])
+        record_login_attempt(conn, f"email:{email}", True)
+        # Upgrade legacy SHA256 hash to werkzeug PBKDF2 on successful login
+        if user.get("password_hash") and not user["password_hash"].startswith("pbkdf2:"):
+            conn.execute("UPDATE users SET password_hash=? WHERE id=?", [hash_password(password), user["id"]])
+            conn.commit()
         user.pop("password_hash", None)
         user.pop("pin", None)
         return {"status": 200, "body": {"token": token, "user": user}}
@@ -2573,11 +2659,16 @@ def dispatch(method, path, params, body, conn):
         pin = body.get("pin", "").strip()
         if not username or not pin:
             return {"status": 400, "body": {"error": "username and pin required"}}
+        allowed, remaining = check_rate_limit(conn, f"pin:{pin}")
+        if not allowed:
+            return {"status": 429, "body": {"error": "Too many attempts. Try again later."}}
         row = conn.execute("SELECT * FROM users WHERE username=? AND pin=? AND is_active=1", [username, pin]).fetchone()
         if not row:
+            record_login_attempt(conn, f"pin:{pin}", False)
             return {"status": 401, "body": {"error": "Invalid username or PIN"}}
         user = row_to_dict(row)
         token = make_token(user["id"], user["role"])
+        record_login_attempt(conn, f"pin:{pin}", True)
         user.pop("password_hash", None)
         user.pop("pin", None)
         return {"status": 200, "body": {"token": token, "user": user}}
@@ -5321,11 +5412,16 @@ def dispatch(method, path, params, body, conn):
         pin = body.get("pin", "").strip()
         if not pin or len(pin) != 6:
             return {"status": 400, "body": {"error": "6-digit PIN required"}}
+        allowed, remaining = check_rate_limit(conn, f"pin:{pin}")
+        if not allowed:
+            return {"status": 429, "body": {"error": "Too many attempts. Try again later."}}
         row = conn.execute("SELECT * FROM users WHERE pin=? AND is_active=1", [pin]).fetchone()
         if not row:
+            record_login_attempt(conn, f"pin:{pin}", False)
             return {"status": 401, "body": {"error": "Invalid PIN"}}
         user = row_to_dict(row)
         token = make_token(user["id"], user["role"])
+        record_login_attempt(conn, f"pin:{pin}", True)
         # Get default truck for this driver
         truck = conn.execute("SELECT * FROM trucks WHERE driver_name=? AND is_active=1",
                              [user["full_name"]]).fetchone()
