@@ -344,7 +344,7 @@ CREATE TABLE IF NOT EXISTS setup_logs (
 CREATE TABLE IF NOT EXISTS pause_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER NOT NULL REFERENCES production_sessions(id),
-    reason TEXT NOT NULL CHECK(reason IN ('material','cleaning','break','breakdown','forklift','urgent_changeover','other')),
+    reason TEXT NOT NULL CHECK(reason IN ('wait_material','tool_breakdown','machine_fault','lunch','smoko_break','qa_hold','waiting_instructions','other')),
     paused_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     resumed_at TIMESTAMP,
     duration_minutes REAL,
@@ -370,6 +370,18 @@ CREATE TABLE IF NOT EXISTS qa_defects (
     quantity INTEGER NOT NULL,
     description TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS drawing_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sku_id INTEGER REFERENCES skus(id),
+    order_item_id INTEGER REFERENCES order_items(id),
+    file_name TEXT NOT NULL,
+    file_type TEXT CHECK(file_type IN ('pdf','image')),
+    file_data TEXT NOT NULL,
+    uploaded_by INTEGER REFERENCES users(id),
+    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    notes TEXT
 );
 
 CREATE TABLE IF NOT EXISTS post_production_processes (
@@ -2259,6 +2271,96 @@ def migrate_db():
     if 'kanban_status' not in o_cols2:
         c.execute("ALTER TABLE orders ADD COLUMN kanban_status TEXT DEFAULT 'red_pending'")
 
+    # --- Block 2 Phase 2: Migrate pause_logs to new reason values ---
+    try:
+        # Check if old constraint exists by looking for old reason values in the table
+        old_reasons_exist = False
+        try:
+            # Try inserting a value that only the old constraint would block (new constraint would also block it)
+            # Instead, check the sqlite_master for the old constraint text
+            tbl_sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='pause_logs'"
+            ).fetchone()
+            if tbl_sql and "urgent_changeover" in (tbl_sql[0] or ""):
+                old_reasons_exist = True
+        except Exception:
+            pass
+
+        if old_reasons_exist:
+            # Map old reason values to new ones
+            reason_map = {
+                "material": "wait_material",
+                "cleaning": "wait_material",
+                "break": "smoko_break",
+                "breakdown": "tool_breakdown",
+                "forklift": "wait_material",
+                "urgent_changeover": "waiting_instructions",
+                "other": "other",
+            }
+            # Fetch all existing rows
+            existing = conn.execute("SELECT * FROM pause_logs").fetchall()
+            cols = [d[0] for d in conn.execute("PRAGMA table_info(pause_logs)").fetchall()]
+            # Recreate table with new constraint
+            conn.execute("DROP TABLE IF EXISTS pause_logs_old")
+            conn.execute("ALTER TABLE pause_logs RENAME TO pause_logs_old")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS pause_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL REFERENCES production_sessions(id),
+                    reason TEXT NOT NULL CHECK(reason IN ('wait_material','tool_breakdown','machine_fault','lunch','smoko_break','qa_hold','waiting_instructions','other')),
+                    paused_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    resumed_at TIMESTAMP,
+                    duration_minutes REAL,
+                    notes TEXT
+                )
+            """)
+            # Re-insert data with mapped reasons
+            for row in existing:
+                rd = dict(zip(cols, row))
+                old_r = rd.get("reason", "other")
+                new_r = reason_map.get(old_r, "other")
+                conn.execute(
+                    "INSERT INTO pause_logs (id, session_id, reason, paused_at, resumed_at, duration_minutes, notes) VALUES (?,?,?,?,?,?,?)",
+                    [rd.get("id"), rd.get("session_id"), new_r, rd.get("paused_at"),
+                     rd.get("resumed_at"), rd.get("duration_minutes"), rd.get("notes")]
+                )
+            conn.execute("DROP TABLE pause_logs_old")
+            conn.commit()
+            print("[migrate_db] pause_logs migrated to new reason values")
+        else:
+            # Table already has new constraint or doesn't exist — ensure it exists with new constraint
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS pause_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL REFERENCES production_sessions(id),
+                    reason TEXT NOT NULL CHECK(reason IN ('wait_material','tool_breakdown','machine_fault','lunch','smoko_break','qa_hold','waiting_instructions','other')),
+                    paused_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    resumed_at TIMESTAMP,
+                    duration_minutes REAL,
+                    notes TEXT
+                )
+            """)
+            conn.commit()
+    except Exception as e:
+        print(f"[migrate_db] pause_logs migration failed: {e}")
+        conn.rollback()
+
+    # --- Block 2 Phase 2: drawing_files table ---
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS drawing_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sku_id INTEGER REFERENCES skus(id),
+            order_item_id INTEGER REFERENCES order_items(id),
+            file_name TEXT NOT NULL,
+            file_type TEXT CHECK(file_type IN ('pdf','image')),
+            file_data TEXT NOT NULL,
+            uploaded_by INTEGER REFERENCES users(id),
+            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            notes TEXT
+        )
+    """)
+    conn.commit()
+
     conn.commit()
 
     conn.close()
@@ -3660,7 +3762,7 @@ def dispatch(method, path, params, body, conn):
             return {"status": 401, "body": {"error": "Authentication required"}}
         sid = int(m["id"])
         reason = body.get("reason")
-        valid_reasons = ["material","cleaning","break","breakdown","forklift","urgent_changeover","other"]
+        valid_reasons = ["wait_material","tool_breakdown","machine_fault","lunch","smoko_break","qa_hold","waiting_instructions","other"]
         if reason not in valid_reasons:
             return {"status": 400, "body": {"error": f"reason must be one of: {valid_reasons}"}}
         session = conn.execute("SELECT * FROM production_sessions WHERE id=?", [sid]).fetchone()
@@ -4004,6 +4106,200 @@ def dispatch(method, path, params, body, conn):
         row = conn.execute("SELECT * FROM qa_audits WHERE id=?", [cur.lastrowid]).fetchone()
         log_audit(conn, current_user["id"], "qa_audit", "qa_audits", cur.lastrowid)
         return {"status": 201, "body": row_to_dict(row)}
+
+    # ----- WORKER APP ENDPOINTS (Block 2 Phase 2) -----
+
+    # GET /production/worker-station-data
+    if method == "GET" and path == "/production/worker-station-data":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        station_id = params.get("station_id")
+        zone_id = params.get("zone_id")
+        if not station_id or not zone_id:
+            return {"status": 400, "body": {"error": "station_id and zone_id required"}}
+        # Get scheduled work orders for this station
+        scheduled = rows_to_list(conn.execute("""
+            SELECT se.*, oi.sku_code, oi.product_name, oi.quantity, oi.produced_quantity, oi.drawing_number,
+                   oi.status as item_status, oi.id as order_item_id,
+                   o.order_number, o.special_instructions, c.company_name as client_name,
+                   s.sell_price, s.labour_mins_per_unit
+            FROM schedule_entries se
+            LEFT JOIN order_items oi ON oi.id=se.order_item_id
+            LEFT JOIN orders o ON o.id=se.order_id
+            LEFT JOIN clients c ON c.id=o.client_id
+            LEFT JOIN skus s ON s.id=oi.sku_id
+            WHERE se.station_id=? AND se.status IN ('planned','in_progress')
+              AND oi.status IN ('C','R','P')
+            ORDER BY se.priority DESC, se.scheduled_date ASC
+        """, [station_id]).fetchall())
+        # Get active/paused sessions at this station
+        active_sessions = rows_to_list(conn.execute("""
+            SELECT ps.*, oi.sku_code, oi.product_name, oi.quantity as order_qty,
+                   oi.drawing_number, o.order_number, c.company_name as client_name,
+                   s.sell_price, s.labour_mins_per_unit
+            FROM production_sessions ps
+            LEFT JOIN order_items oi ON oi.id=ps.order_item_id
+            LEFT JOIN orders o ON o.id=oi.order_id
+            LEFT JOIN clients c ON c.id=o.client_id
+            LEFT JOIN skus s ON s.id=oi.sku_id
+            WHERE ps.station_id=? AND ps.status IN ('active','paused')
+            ORDER BY ps.start_time DESC
+        """, [station_id]).fetchall())
+        for s in active_sessions:
+            s["workers"] = rows_to_list(conn.execute("""
+                SELECT sw.*, u.full_name, u.username
+                FROM session_workers sw JOIN users u ON u.id=sw.user_id
+                WHERE sw.session_id=? AND sw.is_active=1
+            """, [s["id"]]).fetchall())
+            s["pause_logs"] = rows_to_list(conn.execute(
+                "SELECT * FROM pause_logs WHERE session_id=? ORDER BY paused_at DESC", [s["id"]]).fetchall())
+        # Get station and zone info
+        station = row_to_dict(conn.execute("SELECT * FROM stations WHERE id=?", [station_id]).fetchone()) if station_id else None
+        zone = row_to_dict(conn.execute("SELECT * FROM zones WHERE id=?", [zone_id]).fetchone()) if zone_id else None
+        return {"status": 200, "body": {"station": station, "zone": zone, "scheduled_work": scheduled, "active_sessions": active_sessions}}
+
+    # GET /production/combined-progress/:item_id
+    m = match("/production/combined-progress/:item_id", path)
+    if m and method == "GET":
+        item_id = int(m["item_id"])
+        sessions = rows_to_list(conn.execute("""
+            SELECT ps.*, st.name as station_name, z.name as zone_name
+            FROM production_sessions ps
+            LEFT JOIN stations st ON st.id=ps.station_id
+            LEFT JOIN zones z ON z.id=ps.zone_id
+            WHERE ps.order_item_id=? AND ps.status IN ('active','paused','completed')
+            ORDER BY ps.start_time DESC
+        """, [item_id]).fetchall())
+        total_produced = sum(s["produced_quantity"] or 0 for s in sessions)
+        item = row_to_dict(conn.execute("SELECT * FROM order_items WHERE id=?", [item_id]).fetchone())
+        return {"status": 200, "body": {"order_item_id": item_id, "total_produced": total_produced, "target": item["quantity"] if item else 0, "sessions": sessions}}
+
+    # POST /production/shift-changeover
+    if method == "POST" and path == "/production/shift-changeover":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        station_id = body.get("station_id")
+        zone_id = body.get("zone_id")
+        if not station_id:
+            return {"status": 400, "body": {"error": "station_id required"}}
+        # Complete all active sessions at this station
+        active = rows_to_list(conn.execute(
+            "SELECT * FROM production_sessions WHERE station_id=? AND status IN ('active','paused')", [station_id]).fetchall())
+        changeover_results = []
+        for session in active:
+            # Close any open pauses
+            conn.execute("UPDATE pause_logs SET resumed_at=CURRENT_TIMESTAMP, duration_minutes=ROUND((julianday('now')-julianday(paused_at))*1440,2) WHERE session_id=? AND resumed_at IS NULL", [session["id"]])
+            # Mark session completed
+            conn.execute("UPDATE production_sessions SET status='completed', end_time=CURRENT_TIMESTAMP WHERE id=?", [session["id"]])
+            conn.execute("UPDATE session_workers SET scan_off_time=CURRENT_TIMESTAMP, is_active=0 WHERE session_id=? AND is_active=1", [session["id"]])
+            # Update order item produced quantity
+            if session["order_item_id"]:
+                total = conn.execute("SELECT COALESCE(SUM(produced_quantity),0) FROM production_sessions WHERE order_item_id=? AND status='completed'", [session["order_item_id"]]).fetchone()[0]
+                conn.execute("UPDATE order_items SET produced_quantity=? WHERE id=?", [total, session["order_item_id"]])
+            changeover_results.append({"session_id": session["id"], "produced": session["produced_quantity"], "order_item_id": session["order_item_id"]})
+        conn.commit()
+        log_audit(conn, current_user["id"], "shift_changeover", "stations", station_id)
+        return {"status": 200, "body": {"station_id": station_id, "sessions_closed": len(changeover_results), "details": changeover_results}}
+
+    # GET /production/drawings (list, no file_data)
+    if method == "GET" and path == "/production/drawings":
+        where, vals = ["1=1"], []
+        if params.get("sku_id"):
+            where.append("sku_id=?"); vals.append(params["sku_id"])
+        if params.get("order_item_id"):
+            where.append("order_item_id=?"); vals.append(params["order_item_id"])
+        rows = rows_to_list(conn.execute(f"SELECT id, sku_id, order_item_id, file_name, file_type, uploaded_by, uploaded_at, notes FROM drawing_files WHERE {' AND '.join(where)} ORDER BY uploaded_at DESC", vals).fetchall())
+        return {"status": 200, "body": rows}
+
+    # GET /production/drawings/:id (single drawing with file_data)
+    m = match("/production/drawings/:id", path)
+    if m and method == "GET":
+        did = int(m["id"])
+        row = conn.execute("SELECT * FROM drawing_files WHERE id=?", [did]).fetchone()
+        if not row:
+            return {"status": 404, "body": {"error": "Drawing not found"}}
+        return {"status": 200, "body": row_to_dict(row)}
+
+    # POST /production/drawings (upload new drawing)
+    if method == "POST" and path == "/production/drawings":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        for f in ["file_name", "file_data"]:
+            if not body.get(f):
+                return {"status": 400, "body": {"error": f"Field '{f}' required"}}
+        cur = conn.execute("INSERT INTO drawing_files (sku_id, order_item_id, file_name, file_type, file_data, uploaded_by, notes) VALUES (?,?,?,?,?,?,?)",
+            [body.get("sku_id"), body.get("order_item_id"), body["file_name"], body.get("file_type", "image"), body["file_data"], current_user["id"], body.get("notes")])
+        conn.commit()
+        row = conn.execute("SELECT id, sku_id, order_item_id, file_name, file_type, uploaded_by, uploaded_at, notes FROM drawing_files WHERE id=?", [cur.lastrowid]).fetchone()
+        return {"status": 201, "body": row_to_dict(row)}
+
+    # DELETE /production/drawings/:id
+    m = match("/production/drawings/:id", path)
+    if m and method == "DELETE":
+        did = int(m["id"])
+        conn.execute("DELETE FROM drawing_files WHERE id=?", [did])
+        conn.commit()
+        return {"status": 200, "body": {"deleted": did}}
+
+    # GET /production/session-summary/:id
+    m = match("/production/session-summary/:id", path)
+    if m and method == "GET":
+        sid = int(m["id"])
+        session = row_to_dict(conn.execute("""
+            SELECT ps.*, oi.sku_code, oi.product_name, oi.quantity as order_qty, oi.drawing_number,
+                   o.order_number, c.company_name as client_name, st.name as station_name, z.name as zone_name
+            FROM production_sessions ps
+            LEFT JOIN order_items oi ON oi.id=ps.order_item_id
+            LEFT JOIN orders o ON o.id=oi.order_id
+            LEFT JOIN clients c ON c.id=o.client_id
+            LEFT JOIN stations st ON st.id=ps.station_id
+            LEFT JOIN zones z ON z.id=ps.zone_id
+            WHERE ps.id=?
+        """, [sid]).fetchone())
+        if not session:
+            return {"status": 404, "body": {"error": "Session not found"}}
+        # Calculate times
+        pauses = rows_to_list(conn.execute("SELECT * FROM pause_logs WHERE session_id=? ORDER BY paused_at", [sid]).fetchall())
+        total_pause_mins = sum(p["duration_minutes"] or 0 for p in pauses)
+        workers = rows_to_list(conn.execute("SELECT sw.*, u.full_name FROM session_workers sw JOIN users u ON u.id=sw.user_id WHERE sw.session_id=?", [sid]).fetchall())
+        # Net run time
+        start = session.get("start_time")
+        end = session.get("end_time")
+        if start and end:
+            from datetime import datetime as dt2
+            try:
+                s_dt = dt2.fromisoformat(start.replace("Z",""))
+                e_dt = dt2.fromisoformat(end.replace("Z",""))
+                gross_mins = (e_dt - s_dt).total_seconds() / 60
+            except:
+                gross_mins = 0
+        else:
+            gross_mins = 0
+        net_mins = max(0, gross_mins - total_pause_mins)
+        net_hours = net_mins / 60
+        labour_cost = round(net_hours * 55 * max(1, len([w for w in workers if w.get("is_active") is not None])), 2)
+        variance = (session.get("produced_quantity") or 0) - (session.get("target_quantity") or 0)
+        session["pause_logs"] = pauses
+        session["workers"] = workers
+        session["total_pause_minutes"] = round(total_pause_mins, 2)
+        session["net_run_minutes"] = round(net_mins, 2)
+        session["gross_minutes"] = round(gross_mins, 2)
+        session["labour_cost"] = labour_cost
+        session["variance"] = variance
+        return {"status": 200, "body": session}
+
+    # GET /skus/search (SKU autocomplete)
+    if method == "GET" and path == "/skus/search":
+        q = params.get("q", "")
+        zone_id = params.get("zone_id")
+        where, vals = [], []
+        if q:
+            where.append("(s.sku_code LIKE ? OR s.name LIKE ?)"); vals.extend([f"%{q}%", f"%{q}%"])
+        if zone_id:
+            where.append("s.zone_id=?"); vals.append(zone_id)
+        where_str = " AND ".join(where) if where else "1=1"
+        rows = rows_to_list(conn.execute(f"SELECT s.*, z.name as zone_name FROM skus s LEFT JOIN zones z ON z.id=s.zone_id WHERE {where_str} ORDER BY s.sku_code LIMIT 50", vals).fetchall())
+        return {"status": 200, "body": rows}
 
     # ----- DISPATCH -----
     if method == "GET" and path == "/dispatch":
