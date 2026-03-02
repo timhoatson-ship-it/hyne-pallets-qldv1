@@ -1651,7 +1651,7 @@ const OverCapacityModal = ({ modal, token, onClose, onComplete }) => {
 };
 
 // ---- Work Order Card (in grid) ----
-const WOCard = ({ entry, onRemove, onSplit, onEditQty, onDockingComplete, onReschedule }) => {
+const WOCard = ({ entry, onRemove, onSplit, onEditQty, onDockingComplete, onReschedule, onAllocateInventory }) => {
   const [showMenu, setShowMenu] = useState(false);
   const [editingQty, setEditingQty] = useState(false);
   const [qtyVal, setQtyVal] = useState(entry.planned_quantity || 0);
@@ -1702,6 +1702,12 @@ const WOCard = ({ entry, onRemove, onSplit, onEditQty, onDockingComplete, onResc
               <button style={{display:'block',width:'100%',padding:'5px 12px',textAlign:'left',background:'none',border:'none',cursor:'pointer',color:'#2563eb',fontWeight:600}} onClick={() => { onDockingComplete(entry); setShowMenu(false); }}>✓ Docking Complete</button>
             </>
           )}
+          {onAllocateInventory && entry.item_status === 'T' && (
+            <>
+              <div style={{borderTop:'1px solid #d1fae5',margin:'4px 0'}}></div>
+              <button style={{display:'block',width:'100%',padding:'5px 12px',textAlign:'left',background:'none',border:'none',cursor:'pointer',color:'#059669',fontWeight:600}} onClick={() => { onAllocateInventory(entry); setShowMenu(false); }}>📦 Allocate Inventory</button>
+            </>
+          )}
           <div style={{borderTop:'1px solid #f3f4f6',margin:'4px 0'}}></div>
           <button style={{display:'block',width:'100%',padding:'5px 12px',textAlign:'left',background:'none',border:'none',cursor:'pointer',color:'#ef4444'}} onClick={() => { onRemove(entry.id); setShowMenu(false); }}>Remove</button>
         </div>
@@ -1746,7 +1752,7 @@ const WOCard = ({ entry, onRemove, onSplit, onEditQty, onDockingComplete, onResc
 };
 
 // ---- Intake Queue Card ----
-const IntakeCard = ({ item, dragging, onDragStart, onDragEnd, onIssueCutList }) => {
+const IntakeCard = ({ item, dragging, onDragStart, onDragEnd, onIssueCutList, onAllocateInventory }) => {
   const isStock = item.is_stock_run;
   const hasPriority = !!item.requested_delivery_date;
   const invOnHand = item.inventory_on_hand || 0;
@@ -1813,20 +1819,36 @@ const IntakeCard = ({ item, dragging, onDragStart, onDragEnd, onIssueCutList }) 
           </span>
         </div>
       </div>
-      {item.item_status === 'T' && onIssueCutList && (
-        <div style={{marginTop:5,paddingTop:5,borderTop:'1px solid #e2e8f0'}}>
-          <button
-            onClick={e => { e.stopPropagation(); e.preventDefault(); onIssueCutList(item); }}
-            onDragStart={e => e.stopPropagation()}
-            draggable={false}
-            style={{
-              width:'100%',background:'#f59e0b',color:'white',border:'none',
-              borderRadius:4,padding:'3px 6px',fontSize:15,fontWeight:700,
-              cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',gap:3
-            }}
-          >
-            ✂ Issue Cut List
-          </button>
+      {item.item_status === 'T' && (onIssueCutList || onAllocateInventory) && (
+        <div style={{marginTop:5,paddingTop:5,borderTop:'1px solid #e2e8f0',display:'flex',gap:4,flexDirection:'column'}}>
+          {item.item_status === 'T' && onIssueCutList && (
+            <button
+              onClick={e => { e.stopPropagation(); e.preventDefault(); onIssueCutList(item); }}
+              onDragStart={e => e.stopPropagation()}
+              draggable={false}
+              style={{
+                width:'100%',background:'#f59e0b',color:'white',border:'none',
+                borderRadius:4,padding:'3px 6px',fontSize:15,fontWeight:700,
+                cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',gap:3
+              }}
+            >
+              ✂ Issue Cut List
+            </button>
+          )}
+          {item.item_status === 'T' && onAllocateInventory && invOnHand >= qty && (
+            <button
+              onClick={e => { e.stopPropagation(); e.preventDefault(); onAllocateInventory(item); }}
+              onDragStart={e => e.stopPropagation()}
+              draggable={false}
+              style={{
+                width:'100%',background:'#059669',color:'white',border:'none',
+                borderRadius:4,padding:'3px 6px',fontSize:15,fontWeight:700,
+                cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',gap:3
+              }}
+            >
+              📦 Allocate Inventory
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -2286,6 +2308,14 @@ const PlanningBoard = ({ token }) => {
                     try {
                       await api(`/orders/${item.order_id}/verify`, { method: 'PUT' }, token);
                       toast('Cut list issued — order moved to docking', 'success');
+                      loadRef.current();
+                    } catch(e) { toast(e.message, 'error'); }
+                  }}
+                  onAllocateInventory={async (item) => {
+                    if(!window.confirm('Allocate inventory to this order item? This will bypass production and mark as Ready to Dispatch.')) return;
+                    try {
+                      await api('/inventory-allocate', {method:'POST', body:JSON.stringify({order_item_id: item.order_item_id || item.id})}, token);
+                      toast('Inventory allocated — ready for dispatch', 'success');
                       loadRef.current();
                     } catch(e) { toast(e.message, 'error'); }
                   }}
@@ -4089,6 +4119,30 @@ const fmtMinutes = (mins) => {
   return `~${h}h${m}m`;
 };
 
+// ─── KANBAN TRAFFIC LIGHT LEGEND ───────────────────────────────────────────────────
+const KanbanLegend = () => (
+  <div style={{display:'flex',gap:12,padding:'6px 10px',background:'#f8fafc',borderBottom:'1px solid #e2e8f0',flexWrap:'wrap',alignItems:'center'}}>
+    <span style={{fontSize:13,fontWeight:700,color:'#374151',marginRight:4}}>KANBAN:</span>
+    {[
+      {color:'#ef4444',label:'Pending Stock'},
+      {color:'#f59e0b',label:'In Production'},
+      {color:'#f59e0b',label:'In QA',border:true},
+      {color:'#22c55e',label:'Planning'},
+      {color:'#16a34a',label:'Ready to Dispatch'},
+      {color:'#2563eb',label:'Dispatched'},
+      {color:'#dc2626',label:'Delivered',ring:true}
+    ].map((item,i) => (
+      <div key={i} style={{display:'flex',alignItems:'center',gap:4}}>
+        <span style={{
+          width:10,height:10,borderRadius:'50%',background:item.color,display:'inline-block',
+          border: item.ring ? '2px solid #991b1b' : item.border ? '2px solid #92400e' : 'none'
+        }} />
+        <span style={{fontSize:13,color:'#6b7280'}}>{item.label}</span>
+      </div>
+    ))}
+  </div>
+);
+
 // Dispatch delivery card for the board
 const DispatchCard = ({ entry, trucks, onAssign, onAction, onDragStart, onToggleType, token }) => {
   const isOverdue = entry.expected_date && entry.expected_date < localDateStr();
@@ -4119,7 +4173,33 @@ const DispatchCard = ({ entry, trucks, onAssign, onAction, onDragStart, onToggle
     >
       <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:4}}>
         <div>
-          <div style={{fontWeight:800,color:'#07324C',fontSize:15}}>{entry.order_number}</div>
+          <div style={{fontWeight:800,color:'#07324C',fontSize:15,display:'flex',alignItems:'center',gap:6}}>
+            <span style={{
+              width:12,height:12,borderRadius:'50%',flexShrink:0,display:'inline-block',
+              background: entry.order_kanban === 'blue' ? '#2563eb' :
+                          entry.order_kanban === 'green_dispatch' ? '#16a34a' :
+                          entry.order_kanban === 'green_planning' ? '#22c55e' :
+                          entry.order_kanban === 'amber_production' ? '#f59e0b' :
+                          entry.order_kanban === 'amber_qa' ? '#f59e0b' :
+                          entry.order_kanban === 'red_delivered' ? '#dc2626' :
+                          '#ef4444',
+              border: entry.order_kanban === 'red_delivered' ? '2px solid #991b1b' : 'none',
+              boxShadow: '0 0 0 2px white, 0 0 0 3px ' + (
+                entry.order_kanban === 'blue' ? '#2563eb33' :
+                entry.order_kanban?.startsWith('green') ? '#16a34a33' :
+                entry.order_kanban?.startsWith('amber') ? '#f59e0b33' : '#ef444433'
+              )
+            }} title={
+              entry.order_kanban === 'blue' ? 'Dispatched' :
+              entry.order_kanban === 'green_dispatch' ? 'Ready to Dispatch' :
+              entry.order_kanban === 'green_planning' ? 'Planning' :
+              entry.order_kanban === 'amber_production' ? 'In Production' :
+              entry.order_kanban === 'amber_qa' ? 'In QA' :
+              entry.order_kanban === 'red_delivered' ? 'Delivered' :
+              'Pending Stock'
+            } />
+            {entry.order_number}
+          </div>
           <div style={{fontSize:15,color:'#6b7280'}}>{entry.client_name || '—'}</div>
           {entry.client_address && <div style={{fontSize:14,color:'#9ca3af',marginTop:1}}>{entry.client_address}</div>}
         </div>
@@ -4174,7 +4254,7 @@ const DispatchCard = ({ entry, trucks, onAssign, onAction, onDragStart, onToggle
           </span>
         )}
       </div>
-      <div style={{display:'flex',gap:4,marginTop:6}}>
+      <div style={{display:'flex',gap:4,marginTop:6,flexWrap:'wrap'}}>
         {!entry.truck_id && (
           <select style={{flex:1,fontSize:14,padding:'3px 6px',borderRadius:4,border:'1px solid #d1d5db'}}
             value={entry.truck_id || ''}
@@ -4183,10 +4263,21 @@ const DispatchCard = ({ entry, trucks, onAssign, onAction, onDragStart, onToggle
             {trucks.map(t => <option key={t.id} value={t.id}>{t.name} — {t.driver_name}</option>)}
           </select>
         )}
-        {allDone && (
+        {entry.status === 'delivered' ? (
+          <span style={{fontSize:14,fontWeight:800,color:'#dc2626',padding:'3px 8px'}}>DELIVERED</span>
+        ) : entry.status === 'in_transit' || entry.order_kanban === 'blue' ? (
+          <span style={{fontSize:14,fontWeight:700,color:'#5b21b6',padding:'3px 8px',display:'flex',alignItems:'center',gap:4}}>
+            <span style={{color:'#16a34a',fontSize:16}}>✓</span> Dispatched
+          </span>
+        ) : allDone && entry.truck_id ? (
+          <button style={{fontSize:14,padding:'4px 12px',borderRadius:6,background:'#07324C',color:'white',border:'none',cursor:'pointer',fontWeight:700}}
+            onClick={() => onAction(entry.order_id, 'dispatched')}>
+            🚚 Dispatch
+          </button>
+        ) : allDone ? (
           <button style={{fontSize:14,padding:'3px 8px',borderRadius:4,background:'#16a34a',color:'white',border:'none',cursor:'pointer',fontWeight:700}}
             onClick={() => onAction(entry.order_id, 'delivered')}>✓ Delivered</button>
-        )}
+        ) : null}
       </div>
     </div>
   );
@@ -4770,6 +4861,7 @@ const DispatchDashboard = ({ token }) => {
           <select value={numDays} onChange={e => setNumDays(parseInt(e.target.value))} style={{background:'rgba(255,255,255,0.15)',border:'none',color:'white',borderRadius:5,padding:'4px 8px',cursor:'pointer',fontSize:15}}>
             {[1,2,3,4,5,6,7].map(n=><option key={n} value={n} style={{color:'#07324C'}}>{n} Day{n>1?'s':''}</option>)}
           </select>
+          <button onClick={() => setWoModal(true)} style={{background:'#ED1C24',border:'none',color:'white',borderRadius:6,padding:'4px 12px',cursor:'pointer',fontSize:14,fontWeight:700}}>+ Raise Truck WO</button>
           <button onClick={reload} style={{background:'rgba(255,255,255,0.15)',border:'none',color:'white',borderRadius:5,padding:'4px 10px',cursor:'pointer',fontSize:15}}>↺ Refresh</button>
         </div>
 
@@ -4827,11 +4919,20 @@ const DispatchDashboard = ({ token }) => {
             ))}
           </div>
         )}
+
+        {/* Truck Work Order Modal — available on all dispatch sub-pages */}
+        {woModal && (
+          <TruckWorkOrderModal
+            trucks={planData?.trucks || trucks}
+            token={token}
+            onClose={() => setWoModal(false)}
+            onSave={() => { setWoModal(false); reload(); }}
+          />
+        )}
       </div>
     );
   }
 
-  // ─── TRUCK MANAGER SUB-PAGE ───
   if (subPage === 'truckmanager') {
     const DAYS_OF_WEEK = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
     const filteredWOs = truckWOs.filter(wo => {
@@ -5040,16 +5141,13 @@ const DispatchDashboard = ({ token }) => {
           </div>
         )}
 
-        {/* Work Order Create Modal */}
+        {/* Work Order Create Modal — available on all dispatch sub-pages */}
         {woModal && (
           <TruckWorkOrderModal
             trucks={tmTrucks}
             token={token}
             onClose={() => setWoModal(false)}
-            onSave={() => {
-              setWoModal(false);
-              api('/truck-work-orders', {}, token).then(setTruckWOs).catch(()=>{});
-            }}
+            onSave={() => { setWoModal(false); reload(); }}
           />
         )}
       </div>
@@ -5110,13 +5208,16 @@ const DispatchDashboard = ({ token }) => {
           {[1,2,3,4,5,6,7].map(n=><option key={n} value={n} style={{color:'#07324C'}}>{n} Day{n>1?'s':''}</option>)}
         </select>
 
+        <button onClick={() => setWoModal(true)} style={{background:'#ED1C24',border:'none',color:'white',borderRadius:6,padding:'4px 12px',cursor:'pointer',fontSize:14,fontWeight:700}}>+ Raise Truck WO</button>
         <button onClick={reload} style={{background:'rgba(255,255,255,0.15)',border:'none',color:'white',borderRadius:5,padding:'4px 10px',cursor:'pointer',fontSize:15}}>↺ Refresh</button>
       </div>
 
       {loading ? (
         <div style={{flex:1,display:'flex',alignItems:'center',justifyContent:'center'}}><Spinner /></div>
       ) : (
-        <div style={{flex:1,display:'flex',overflow:'hidden'}}>
+        <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden'}}>
+          <KanbanLegend />
+          <div style={{flex:1,display:'flex',overflow:'hidden'}}>
 
           {/* LEFT: Deliveries Queue (unassigned) */}
           <div style={{width:220,flexShrink:0,background:'#f8fafc',borderRight:'2px solid #e2e8f0',display:'flex',flexDirection:'column',overflow:'hidden'}}>
@@ -5283,6 +5384,8 @@ const DispatchDashboard = ({ token }) => {
             </div>
           </div>
 
+          </div>
+          </div>
         </div>
       )}
 
@@ -5335,6 +5438,19 @@ const DispatchDashboard = ({ token }) => {
 
       {/* Delivery Reschedule Confirmation Modal */}
       <DispatchRescheduleModal info={rescheduleInfo} onConfirm={confirmReschedule} onCancel={()=>setRescheduleInfo(null)} />
+
+      {/* Truck Work Order Modal — available on all dispatch sub-pages */}
+      {woModal && (
+        <TruckWorkOrderModal
+          trucks={allTrucks.length > 0 ? allTrucks : trucks}
+          token={token}
+          onClose={() => setWoModal(false)}
+          onSave={() => {
+            setWoModal(false);
+            reload();
+          }}
+        />
+      )}
     </div>
   );
 };
