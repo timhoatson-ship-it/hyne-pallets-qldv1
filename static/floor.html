@@ -140,7 +140,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 // ═══════════════════════════════════════════════════════════════
 const API_BASE = window.location.origin + '/api';
 const SESSION_KEY = 'hyne_floor_session';
-const QA_INTERVAL = 20;
+let QA_INTERVAL = 20;
 const LABOUR_RATE = 55;
 const ALLOWED_ROLES = ['floor_worker','executive','admin','production_manager','qa_lead'];
 
@@ -450,6 +450,7 @@ const HomeScreen = ({ token, user, zone, station, sessionStart, onStartJob, onSt
   const [manualQty, setManualQty] = useState('');
   const [setupDesc, setSetupDesc] = useState('');
   const [setupSku, setSetupSku] = useState(null);
+  const [setupWo, setSetupWo] = useState(null);
   const [drawings, setDrawings] = useState([]);
   const [drawingsLoading, setDrawingsLoading] = useState(false);
   const pollRef = useRef(null);
@@ -458,6 +459,7 @@ const HomeScreen = ({ token, user, zone, station, sessionStart, onStartJob, onSt
     try {
       const d = await api(`/production/worker-station-data?station_id=${station.id}&zone_id=${zone.id}`,{},token);
       setStationData(d);
+      if (d.zone?.qa_interval) QA_INTERVAL = d.zone.qa_interval;
     } catch(e){ console.warn('station data err',e); }
     finally { setLoading(false); }
   },[station, zone, token]);
@@ -479,6 +481,7 @@ const HomeScreen = ({ token, user, zone, station, sessionStart, onStartJob, onSt
   };
 
   const workOrders = stationData?.scheduled_work || stationData?.work_orders || [];
+  const activeSessions = stationData?.active_sessions || [];
 
   return (
     <div style={{minHeight:'100vh',display:'flex',flexDirection:'column',background:'#F0F2F5'}}>
@@ -500,6 +503,55 @@ const HomeScreen = ({ token, user, zone, station, sessionStart, onStartJob, onSt
       <div className="content-area" style={{flex:1}}>
         {tab==='job' && (
           <div style={{padding:'18px 16px'}}>
+            {/* Active Jobs at This Station */}
+            {activeSessions.length > 0 && (
+              <>
+                <div className="section-lbl">Active Jobs at This Station</div>
+                {activeSessions.map(sess => (
+                  <div key={sess.id} className="wo-card" style={{borderLeftColor:'#059669'}}>
+                    <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:'10px'}}>
+                      <div>
+                        <div style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'26px',fontWeight:800,color:'#059669'}}>
+                          {sess.status === 'active' ? '● ACTIVE' : '⏸ PAUSED'} — WO# {sess.order_number || sess.id}
+                        </div>
+                        <div style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'22px',fontWeight:700,color:'#374151'}}>{sess.product_name || sess.sku_code || 'Manual Job'}</div>
+                        {sess.client_name && <div style={{fontSize:'16px',color:'#6B7280',marginTop:'2px'}}>📍 {sess.client_name}</div>}
+                      </div>
+                    </div>
+                    {sess.workers && sess.workers.length > 0 && (
+                      <div style={{display:'flex',flexWrap:'wrap',gap:'6px',marginBottom:'12px'}}>
+                        {sess.workers.map((w,i) => <span key={i} className="worker-chip">👷 {w.full_name || w.username}</span>)}
+                      </div>
+                    )}
+                    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'10px',marginBottom:'14px'}}>
+                      <div style={{background:'#F0F2F5',borderRadius:'10px',padding:'10px 14px'}}>
+                        <div style={{fontSize:'14px',color:'#9CA3AF',fontWeight:600}}>Produced</div>
+                        <div style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'28px',fontWeight:800,color:'#059669'}}>{sess.produced_quantity || 0}</div>
+                      </div>
+                      <div style={{background:'#F0F2F5',borderRadius:'10px',padding:'10px 14px'}}>
+                        <div style={{fontSize:'14px',color:'#9CA3AF',fontWeight:600}}>Workers</div>
+                        <div style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'28px',fontWeight:800,color:'#07324C'}}>{(sess.workers||[]).length}</div>
+                      </div>
+                    </div>
+                    {(sess.workers||[]).length < 2 && (
+                      <button className="action-btn" onClick={async () => {
+                        try {
+                          await api(`/production/sessions/${sess.id}/workers`, {method:'POST',body:JSON.stringify({user_id:user.id})}, token);
+                          await api('/production/floor-event', {method:'POST',body:JSON.stringify({event_type:'worker_join_session',entity_type:'production_sessions',entity_id:sess.id,zone:zone?.name,station:station?.name})}, token);
+                          toast('Joined active job','success');
+                          onStartJob({type:'wo', wo:{...sess, order_number:sess.order_number, quantity:sess.order_qty||sess.target_quantity, produced_quantity:sess.produced_quantity, sku_code:sess.sku_code, product_name:sess.product_name, client_name:sess.client_name, order_item_id:sess.order_item_id, drawing_number:sess.drawing_number}, sessionId:sess.id});
+                        } catch(e) { toast('Could not join: ' + e.message, 'error'); }
+                      }} style={{width:'100%',background:'#059669',fontSize:'20px'}}>
+                        👷 JOIN THIS JOB (2nd Worker)
+                      </button>
+                    )}
+                    {(sess.workers||[]).length >= 2 && (
+                      <div style={{textAlign:'center',color:'#9CA3AF',fontSize:'16px',fontWeight:600,padding:'10px'}}>Station at max capacity (2 workers)</div>
+                    )}
+                  </div>
+                ))}
+              </>
+            )}
             {/* Scheduled Work Orders */}
             <div className="section-lbl">Scheduled Work Orders</div>
             {loading ? (
@@ -566,6 +618,15 @@ const HomeScreen = ({ token, user, zone, station, sessionStart, onStartJob, onSt
             {/* Setup / Jig Timer */}
             <div className="section-lbl">Setup / Jig Timer</div>
             <div style={{background:'white',borderRadius:'16px',padding:'20px',boxShadow:'0 2px 8px rgba(0,0,0,.07)'}}>
+              {workOrders.length > 0 && (
+                <div style={{marginBottom:'12px'}}>
+                  <div style={{fontSize:'16px',fontWeight:600,color:'#374151',marginBottom:'6px'}}>Link to Work Order (optional)</div>
+                  <select className="sku-input" value={setupWo||''} onChange={e=>{const v=e.target.value;setSetupWo(v?workOrders.find(w=>(w.id||w.order_item_id)==Number(v)):null);}} style={{width:'100%'}}>
+                    <option value="">— No WO linked —</option>
+                    {workOrders.map(wo=><option key={wo.id||wo.order_item_id} value={wo.id||wo.order_item_id}>WO# {wo.order_number} — {wo.sku_code}</option>)}
+                  </select>
+                </div>
+              )}
               <div style={{marginBottom:'12px'}}>
                 <div style={{fontSize:'16px',fontWeight:600,color:'#374151',marginBottom:'6px'}}>Description (optional)</div>
                 <input className="sku-input" value={setupDesc} onChange={e=>setSetupDesc(e.target.value)} placeholder="e.g. Jig setup for Viking 800" style={{width:'100%'}} />
@@ -574,7 +635,7 @@ const HomeScreen = ({ token, user, zone, station, sessionStart, onStartJob, onSt
                 <div style={{fontSize:'16px',fontWeight:600,color:'#374151',marginBottom:'6px'}}>Link to SKU (optional)</div>
                 <SkuSearch token={token} zoneId={zone?.id} onSelect={setSetupSku} placeholder="Optional — link to SKU" />
               </div>
-              <button className="action-btn" onClick={()=>onStartSetup({desc:setupDesc,sku:setupSku})}
+              <button className="action-btn" onClick={()=>onStartSetup({desc:setupDesc,sku:setupSku,wo:setupWo})}
                 style={{width:'100%',background:'#F59E0B',fontSize:'20px'}}>
                 ⏱ START SETUP TIMER
               </button>
@@ -653,13 +714,15 @@ const SetupTimerScreen = ({ token, user, zone, station, sessionStart, setupInfo,
   useEffect(()=>{
     const begin = async()=>{
       try {
-        const d = await api('/production/sessions',{method:'POST',body:JSON.stringify({
-          station_id:station.id, zone_id:zone.id,
-          order_item_id:null, target_quantity:0, notes:setupInfo.desc||'Setup', is_sub_assembly:0
+        const d = await api('/setup',{method:'POST',body:JSON.stringify({
+          station_id:station.id, order_item_id:setupInfo.wo?.order_item_id||setupInfo.sku?.order_item_id||null,
+          setup_type:zone?.name==='Viking'?'machine_setup':'jig_setup',
+          notes:setupInfo.desc||'Setup'
         })},token);
-        setSessionId(d.id||d.session_id);
+        setSessionId(d.id);
         setStarted(true);
-      } catch(e){ toast('Could not start setup session','error'); }
+        api('/production/floor-event',{method:'POST',body:JSON.stringify({event_type:'setup_started',entity_type:'setup_logs',entity_id:d.id,zone:zone?.name,station:station?.name,description:setupInfo.desc})},token).catch(()=>{});
+      } catch(e){ toast('Could not start setup: '+e.message,'error'); }
     };
     begin();
   },[]);
@@ -667,10 +730,11 @@ const SetupTimerScreen = ({ token, user, zone, station, sessionStart, setupInfo,
   const complete = async(startJob)=>{
     try {
       if (sessionId) {
-        await api(`/production/sessions/${sessionId}/complete`,{method:'PUT',body:JSON.stringify({})},token);
+        await api(`/setup/${sessionId}/complete`,{method:'PUT',body:JSON.stringify({qa_checklist_passed:1})},token);
       }
     } catch(e){}
-    if (startJob) onStartJobFromSetup(sessionId);
+    api('/production/floor-event',{method:'POST',body:JSON.stringify({event_type:'setup_completed',entity_type:'setup_logs',entity_id:sessionId,duration_seconds:elapsed,zone:zone?.name,station:station?.name})},token).catch(()=>{});
+    if (startJob) onStartJobFromSetup(null);
     else onFinishSetup(elapsed);
   };
 
@@ -818,9 +882,14 @@ const ActiveJobScreen = ({ token, user, zone, station, sessionStart, jobInfo, on
             <div style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'22px',fontWeight:800,letterSpacing:'0.05em'}}>🔍 QA CHECK DUE</div>
             <div style={{fontSize:'16px',opacity:0.9}}>Every {QA_INTERVAL} pallets — check quality now</div>
           </div>
-          <button onClick={()=>setQaAlert(false)}
+          <button onClick={async()=>{
+            try {
+              await api('/production/qa-check',{method:'POST',body:JSON.stringify({session_id:sessionId,pallet_count:pallets,passed:1})},token);
+            } catch(e){}
+            setQaAlert(false);
+          }}
             style={{background:'white',color:'#92400E',border:'none',borderRadius:'10px',padding:'10px 18px',fontSize:'17px',fontWeight:800,flexShrink:0}}>
-            Acknowledge
+            ✓ QA Passed
           </button>
         </div>
       )}
@@ -904,7 +973,10 @@ const ActiveJobScreen = ({ token, user, zone, station, sessionStart, jobInfo, on
             style={{background:status==='paused'?'#059669':'#F59E0B',flexDirection:'column',gap:'4px',padding:'18px 8px',fontSize:'17px'}}>
             {status==='paused'?'▶ RESUME':'⏸ PAUSE'}
           </button>
-          <button className="action-btn" onClick={onSwitchSku}
+          <button className="action-btn" onClick={()=>{
+            api('/production/floor-event',{method:'POST',body:JSON.stringify({event_type:'switch_sku',entity_type:'production_sessions',entity_id:sessionId,from_sku:wo.sku_code||sku.sku_code,zone:zone?.name,station:station?.name})},token).catch(()=>{});
+            onSwitchSku();
+          }}
             style={{background:'#3B82F6',flexDirection:'column',gap:'4px',padding:'18px 8px',fontSize:'17px'}}>
             🔄 SWITCH SKU
           </button>
@@ -1164,6 +1236,7 @@ const App = () => {
 
   const handleLogin = (tok, usr) => {
     setToken(tok); setUser(usr); setScreen('zone_select');
+    api('/production/floor-event',{method:'POST',body:JSON.stringify({event_type:'worker_login',entity_type:'users',entity_id:usr.id})},tok).catch(()=>{});
   };
 
   const handleZoneStation = (z, s) => {
@@ -1210,6 +1283,7 @@ const App = () => {
   };
 
   const doLogout = () => {
+    if (token) api('/production/floor-event',{method:'POST',body:JSON.stringify({event_type:'worker_logout',entity_type:'users',entity_id:user?.id,zone:zone?.name,station:station?.name})},token).catch(()=>{});
     localStorage.removeItem(SESSION_KEY);
     setToken(null); setUser(null); setZone(null); setStation(null);
     setJobInfo(null); setActiveSessionId(null); setSessionStart(null);

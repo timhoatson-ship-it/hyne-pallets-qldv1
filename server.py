@@ -3053,6 +3053,13 @@ def dispatch(method, path, params, body, conn):
         except Exception as e:
             return {"status": 409, "body": {"error": str(e)}}
 
+    if method == "GET" and path == "/stations":
+        where, vals = ["is_active=1"], []
+        if params.get("zone_id"):
+            where.append("zone_id=?"); vals.append(params["zone_id"])
+        rows = rows_to_list(conn.execute(f"SELECT * FROM stations WHERE {' AND '.join(where)} ORDER BY name", vals).fetchall())
+        return {"status": 200, "body": rows}
+
     if method == "POST" and path == "/stations":
         for f in ["zone_id", "name", "code", "station_type"]:
             if not body.get(f):
@@ -3737,6 +3744,22 @@ def dispatch(method, path, params, body, conn):
         except Exception as e:
             return {"status": 409, "body": {"error": str(e)}}
 
+    m = match("/production/sessions/:id", path)
+    if m and method == "GET":
+        sid = int(m["id"])
+        session = conn.execute("SELECT * FROM production_sessions WHERE id=?", [sid]).fetchone()
+        if not session:
+            return {"status": 404, "body": {"error": "Session not found"}}
+        s = row_to_dict(session)
+        s["workers"] = rows_to_list(conn.execute("SELECT sw.*, u.full_name, u.username FROM session_workers sw JOIN users u ON u.id=sw.user_id WHERE sw.session_id=? AND sw.is_active=1", [sid]).fetchall())
+        # Calculate pause info
+        pauses = rows_to_list(conn.execute("SELECT * FROM pause_logs WHERE session_id=? ORDER BY paused_at DESC", [sid]).fetchall())
+        s["pause_logs"] = pauses
+        open_pause = next((p for p in pauses if p.get("resumed_at") is None), None)
+        if open_pause:
+            s["paused_at"] = open_pause["paused_at"]
+        return {"status": 200, "body": s}
+
     m = match("/production/sessions/:id/log", path)
     if m and method == "PUT":
         if not current_user:
@@ -4174,6 +4197,73 @@ def dispatch(method, path, params, body, conn):
         item = row_to_dict(conn.execute("SELECT * FROM order_items WHERE id=?", [item_id]).fetchone())
         return {"status": 200, "body": {"order_item_id": item_id, "total_produced": total_produced, "target": item["quantity"] if item else 0, "sessions": sessions}}
 
+    # GET /production/shift-summary
+    if method == "GET" and path == "/production/shift-summary":
+        station_id = params.get("station_id")
+        zone_id = params.get("zone_id")
+        if not station_id:
+            return {"status": 400, "body": {"error": "station_id required"}}
+        # Get all sessions at this station today
+        active = rows_to_list(conn.execute(
+            "SELECT * FROM production_sessions WHERE station_id=? AND status IN ('active','paused')", [station_id]).fetchall())
+        completed_today = rows_to_list(conn.execute(
+            "SELECT * FROM production_sessions WHERE station_id=? AND status='completed' AND DATE(end_time)=DATE('now')", [station_id]).fetchall())
+        all_sessions = active + completed_today
+        total_produced = sum(s.get("produced_quantity") or 0 for s in all_sessions)
+        # Calculate total run seconds
+        total_run_secs = 0
+        for s in all_sessions:
+            start = s.get("start_time")
+            end = s.get("end_time")
+            if start:
+                from datetime import datetime as dt2
+                try:
+                    s_dt = dt2.fromisoformat(start.replace("Z",""))
+                    e_dt = dt2.fromisoformat(end.replace("Z","")) if end else dt2.utcnow()
+                    gross_secs = (e_dt - s_dt).total_seconds()
+                    # Subtract pauses
+                    pause_mins = sum(p["duration_minutes"] or 0 for p in rows_to_list(conn.execute(
+                        "SELECT duration_minutes FROM pause_logs WHERE session_id=?", [s["id"]]).fetchall()))
+                    total_run_secs += max(0, gross_secs - pause_mins * 60)
+                except:
+                    pass
+        return {"status": 200, "body": {
+            "station_id": int(station_id),
+            "sessions_active": len(active),
+            "sessions_closed": len(completed_today),
+            "total_produced": total_produced,
+            "total_run_seconds": round(total_run_secs)
+        }}
+
+    # POST /production/floor-event (worker event logging)
+    if method == "POST" and path == "/production/floor-event":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        event_type = body.get("event_type")
+        if not event_type:
+            return {"status": 400, "body": {"error": "event_type required"}}
+        log_audit(conn, current_user["id"], event_type, body.get("entity_type", "worker_app"), body.get("entity_id"), None, json.dumps({k:v for k,v in body.items() if k not in ("event_type","entity_type","entity_id")}))
+        return {"status": 200, "body": {"logged": True, "event_type": event_type}}
+
+    # POST /production/qa-check (floor QA alert acknowledgement)
+    if method == "POST" and path == "/production/qa-check":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        session_id = body.get("session_id")
+        if not session_id:
+            return {"status": 400, "body": {"error": "session_id required"}}
+        session = conn.execute("SELECT * FROM production_sessions WHERE id=?", [session_id]).fetchone()
+        if not session:
+            return {"status": 404, "body": {"error": "Session not found"}}
+        try:
+            cur = conn.execute("""INSERT INTO qa_inspections (order_item_id, session_id, inspection_type, batch_size, passed, inspector_id, notes)
+                VALUES (?,?,'batch',?,?,?,?)""",
+                [session["order_item_id"], session_id, body.get("pallet_count", 0), body.get("passed", 1), current_user["id"], body.get("notes", f"QA check at {body.get('pallet_count', 0)} pallets")])
+            conn.commit()
+            return {"status": 201, "body": {"id": cur.lastrowid, "logged": True}}
+        except Exception as e:
+            return {"status": 500, "body": {"error": str(e)}}
+
     # POST /production/shift-changeover
     if method == "POST" and path == "/production/shift-changeover":
         if not current_user:
@@ -4196,6 +4286,14 @@ def dispatch(method, path, params, body, conn):
             if session["order_item_id"]:
                 total = conn.execute("SELECT COALESCE(SUM(produced_quantity),0) FROM production_sessions WHERE order_item_id=? AND status='completed'", [session["order_item_id"]]).fetchone()[0]
                 conn.execute("UPDATE order_items SET produced_quantity=? WHERE id=?", [total, session["order_item_id"]])
+            # QA check on shift changeover
+            if session["order_item_id"]:
+                try:
+                    conn.execute("""INSERT INTO qa_inspections (order_item_id, session_id, inspection_type, batch_size, inspector_id, notes)
+                        VALUES (?,?,'batch',?,?,?)""",
+                        [session["order_item_id"], session["id"], session["produced_quantity"] or 0, current_user["id"], "Auto-created: shift changeover QA check"])
+                except:
+                    pass
             changeover_results.append({"session_id": session["id"], "produced": session["produced_quantity"], "order_item_id": session["order_item_id"]})
         conn.commit()
         log_audit(conn, current_user["id"], "shift_changeover", "stations", station_id)
